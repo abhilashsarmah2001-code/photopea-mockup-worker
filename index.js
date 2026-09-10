@@ -2,22 +2,32 @@ const express = require('express');
 const puppeteer = require('puppeteer');
 
 const app = express();
-app.use(express.json({ limit: '100mb' }));
+app.use(express.json({ limit: '50mb' }));
 
-// Verified Direct Download PSD Links
 const PSD_A = "https://drive.google.com/uc?export=download&id=1HwQTBETW8d1UhkLcdc2Usubssjcbvge-";
 const PSD_B = "https://drive.google.com/uc?export=download&id=1vLsCsc3F_2z8rwUkcRf_N9vdHJZCsQyb";
 const PSD_C = "https://drive.google.com/uc?export=download&id=1ne19kNLFbVXr2sIURpdG0XSdEhYtBfFV";
 
-async function runPhotopeaExport(browser, templatePsdUrl, layersToReplace, hideBackground = false) {
-    const page = await browser.newPage();
-    
-    // files[0] is the PSD; the rest are the cover images
+const PUPPETEER_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-accelerated-2d-canvas',
+    '--no-first-run',
+    '--no-zygote',
+    '--single-process',
+    '--disable-gpu',
+    '--js-flags="--max-old-space-size=256"'
+];
+
+// Helper: processes one PSD and can export both Normal and Transparent in a single load
+async function processTemplate(page, templatePsdUrl, layersToReplace, exportBoth = false) {
     const files = [templatePsdUrl, ...layersToReplace.map(l => l.url)];
-    
+
+    // Photopea script handles dual export if exportBoth is true
     const script = `
         var doc = app.documents[0];
-        
+
         function getLayer(container, name) {
             for (var i = 0; i < container.layers.length; i++) {
                 var l = container.layers[i];
@@ -50,28 +60,37 @@ async function runPhotopeaExport(browser, templatePsdUrl, layersToReplace, hideB
 
         ${layersToReplace.map((item, idx) => `replaceSmartObject("${item.name}", ${idx + 1});`).join('\n')}
 
-        var bg = getLayer(doc, "BACKGROUND");
-        if (bg && ${hideBackground}) {
-            bg.visible = false;
-        }
-
         app.activeDocument = doc;
+        // First export: Full with background
         doc.saveToOE("png");
+
+        if (${exportBoth}) {
+            var bg = getLayer(doc, "BACKGROUND");
+            if (bg) {
+                bg.visible = false;
+            }
+            // Second export: Transparent
+            doc.saveToOE("png");
+        }
     `;
 
     const config = { files, script };
     const targetUrl = `https://www.photopea.com#${encodeURIComponent(JSON.stringify(config))}`;
 
     return new Promise(async (resolve, reject) => {
+        const receivedBuffers = [];
+        const requiredCount = exportBoth ? 2 : 1;
+
         const timeout = setTimeout(async () => {
-            await page.close();
-            reject(new Error("Photopea processing timed out (300s)."));
-        }, 300000);
+            reject(new Error("Photopea processing timed out on template."));
+        }, 180000);
 
         await page.exposeFunction('onReceiveBuffer', async (base64) => {
-            clearTimeout(timeout);
-            await page.close();
-            resolve(base64);
+            receivedBuffers.push(base64);
+            if (receivedBuffers.length === requiredCount) {
+                clearTimeout(timeout);
+                resolve(receivedBuffers);
+            }
         });
 
         await page.evaluateOnNewDocument(() => {
@@ -79,8 +98,7 @@ async function runPhotopeaExport(browser, templatePsdUrl, layersToReplace, hideB
                 if (e.data instanceof ArrayBuffer) {
                     var binary = '';
                     var bytes = new Uint8Array(e.data);
-                    var len = bytes.byteLength;
-                    for (var i = 0; i < len; i++) {
+                    for (var i = 0; i < bytes.byteLength; i++) {
                         binary += String.fromCharCode(bytes[i]);
                     }
                     window.onReceiveBuffer(window.btoa(binary));
@@ -88,60 +106,59 @@ async function runPhotopeaExport(browser, templatePsdUrl, layersToReplace, hideB
             });
         });
 
-        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 300000 });
+        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 180000 });
     });
 }
 
+app.get('/', (req, res) => res.send("Photopea Worker is live!"));
+
 app.post('/generate-mockups', async (req, res) => {
     const { frontUrl, spineUrl, backUrl } = req.body;
-    
     if (!frontUrl || !spineUrl || !backUrl) {
         return res.status(400).json({ error: "Missing frontUrl, spineUrl, or backUrl in body." });
     }
 
     let browser;
     try {
+        console.log("Launching low-memory Chrome instance...");
         browser = await puppeteer.launch({
             headless: "new",
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args: PUPPETEER_ARGS
         });
 
-        // Template A (Front + Spine)
-        console.log("Generating Template A (Background)...");
-        const a_normal = await runPhotopeaExport(browser, PSD_A, [
-            { name: "SO_FRONT", url: frontUrl },
-            { name: "SO_SPINE", url: spineUrl }
-        ], false);
-
-        console.log("Generating Template A (Transparent)...");
-        const a_transparent = await runPhotopeaExport(browser, PSD_A, [
+        // --- TEMPLATE A (Generates both Full & Transparent in 1 load) ---
+        console.log("Processing Template A (Full & Transparent)...");
+        let page = await browser.newPage();
+        const [a_normal, a_transparent] = await processTemplate(page, PSD_A, [
             { name: "SO_FRONT", url: frontUrl },
             { name: "SO_SPINE", url: spineUrl }
         ], true);
+        await page.goto("about:blank");
+        await page.close();
 
-        // Template B (Front + Spine + Back)
-        console.log("Generating Template B (Background)...");
-        const b_normal = await runPhotopeaExport(browser, PSD_B, [
-            { name: "SO_FRONT", url: frontUrl },
-            { name: "SO_SPINE", url: spineUrl },
-            { name: "SO_BACK", url: backUrl }
-        ], false);
-
-        console.log("Generating Template B (Transparent)...");
-        const b_transparent = await runPhotopeaExport(browser, PSD_B, [
+        // --- TEMPLATE B (Generates both Full & Transparent in 1 load) ---
+        console.log("Processing Template B (Full & Transparent)...");
+        page = await browser.newPage();
+        const [b_normal, b_transparent] = await processTemplate(page, PSD_B, [
             { name: "SO_FRONT", url: frontUrl },
             { name: "SO_SPINE", url: spineUrl },
             { name: "SO_BACK", url: backUrl }
         ], true);
+        await page.goto("about:blank");
+        await page.close();
 
-        // Template C (Back Only)
-        console.log("Generating Template C...");
-        const c_normal = await runPhotopeaExport(browser, PSD_C, [
+        // --- TEMPLATE C (Straight Back) ---
+        console.log("Processing Template C...");
+        page = await browser.newPage();
+        const [c_normal] = await processTemplate(page, PSD_C, [
             { name: "SO_BACK", url: backUrl }
         ], false);
+        await page.goto("about:blank");
+        await page.close();
 
         await browser.close();
 
+        console.log("All 5 mockups exported successfully!");
         res.json({
             template_a_bg: a_normal,
             template_a_trans: a_transparent,
@@ -152,7 +169,7 @@ app.post('/generate-mockups', async (req, res) => {
 
     } catch (err) {
         if (browser) await browser.close();
-        console.error(err);
+        console.error("Worker Error:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
