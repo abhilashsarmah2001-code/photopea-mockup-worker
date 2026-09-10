@@ -65,8 +65,8 @@ async function runPhotopeaExport(browser, templatePsdUrl, layersToReplace, hideB
     return new Promise(async (resolve, reject) => {
         const timeout = setTimeout(async () => {
             await page.close();
-            reject(new Error("Photopea processing timed out (120s)."));
-        }, 120000);
+            reject(new Error("Photopea processing timed out (300s)."));
+        }, 300000);
 
         await page.exposeFunction('onReceiveBuffer', async (base64) => {
             clearTimeout(timeout);
@@ -88,7 +88,7 @@ async function runPhotopeaExport(browser, templatePsdUrl, layersToReplace, hideB
             });
         });
 
-        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 120000 });
+        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 300000 });
     });
 }
 
